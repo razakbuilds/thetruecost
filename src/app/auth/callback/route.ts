@@ -1,68 +1,73 @@
-// import { NextResponse } from "next/server";
-// import { createSupabaseServerClient } from "@/lib/supabase-server";
-
-// export async function GET(request: Request) {
-//   const url = new URL(request.url);
-//   const code = url.searchParams.get("code");
-//   const next = url.searchParams.get("next") || "/dashboard";
-
-//   if (code) {
-//     const supabase = await createSupabaseServerClient();
-//     await supabase.auth.exchangeCodeForSession(code);
-//   }
-
-//   return NextResponse.redirect(new URL(next, url.origin));
-// }
 import { NextResponse } from 'next/server';
-import { getCurrentUser, getCurrentUserRoles } from '@/lib/truecost/auth';
+import { createSupabaseServerClient } from '@/lib/supabase-server';
 
-export async function GET() {
-  try {
-    const { supabase, user } = await getCurrentUser();
+const ALLOWED_NEXT_PREFIXES = [
+  '/dashboard',
+  '/events',
+  '/billing',
+  '/planner',
+  '/vendors',
+];
 
-    if (!user) {
-      return NextResponse.json(
-        {
-          authenticated: false,
-        },
-        { status: 401 }
-      );
-    }
+function getSafeNext(request: Request) {
+  const url = new URL(request.url);
+  const next = url.searchParams.get('next');
 
-    const roles = await getCurrentUserRoles(supabase, user.id);
+  if (!next) {
+    return '/dashboard';
+  }
 
-    const { data: profile, error: profileError } = await supabase
-      .from('profiles')
-      .select('id,email,phone,full_name,avatar_url,status')
-      .eq('id', user.id)
-      .maybeSingle();
+  const allowed = ALLOWED_NEXT_PREFIXES.some(
+    (prefix) => next === prefix || next.startsWith(`${prefix}/`)
+  );
 
-    if (profileError) {
-      return NextResponse.json(
-        { error: profileError.message },
-        { status: 500 }
-      );
-    }
+  return allowed ? next : '/dashboard';
+}
 
-    return NextResponse.json({
-      authenticated: true,
-      user: {
-        id: user.id,
-        email: user.email ?? null,
-        phone: user.phone ?? null,
-      },
-      profile,
-      roles,
-      defaultRole: roles.includes('host') ? 'host' : (roles[0] ?? null),
-    });
-  } catch (error) {
-    console.error('GET /api/me', error);
+export async function GET(request: Request) {
+  const url = new URL(request.url);
+  const code = url.searchParams.get('code');
 
-    return NextResponse.json(
-      {
-        error: 'Unable to load account information.',
-      },
-      { status: 500 }
+  if (!code) {
+    return NextResponse.redirect(
+      new URL('/auth?error=missing_code', url.origin)
     );
   }
+
+  const supabase = await createSupabaseServerClient();
+
+  const { error } = await supabase.auth.exchangeCodeForSession(code);
+
+  if (error) {
+    console.error('Auth callback error:', error);
+
+    return NextResponse.redirect(
+      new URL('/auth?error=auth_failed', url.origin)
+    );
+  }
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) {
+    return NextResponse.redirect(
+      new URL('/auth?error=session_failed', url.origin)
+    );
+  }
+
+  // Ensure every authenticated user has the default host role.
+  // The DB trigger should normally already do this.
+  await supabase.from('user_roles').upsert(
+    {
+      user_id: user.id,
+      role: 'host',
+    },
+    {
+      onConflict: 'user_id,role',
+      ignoreDuplicates: true,
+    }
+  );
+
+  return NextResponse.redirect(new URL(getSafeNext(request), url.origin));
 }
